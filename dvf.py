@@ -1,33 +1,65 @@
+"""
+module de depart pour un projet de MLOPS
+"""
 from pathlib import Path
+import os
+import argparse
+import duckdb
+import geopandas as gpd
+import pandas as pd
 import requests
 import seaborn as sns
-import pandas as pd
-import geopandas as gpd
-import os
-import duckdb
+import numpy as np
+from lightgbm import LGBMRegressor
+from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import FunctionTransformer, OrdinalEncoder
+from sklearn.metrics import root_mean_squared_error
+from sklearn.base import clone
+import matplotlib.pyplot as plt
+from skore import EstimatorReport
+from dotenv import load_dotenv
 
 
+load_dotenv()
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--n_trees", type=int, default=1500, help="Nombre d'arbres"
+)
+args = parser.parse_args()
+n_trees = args.n_trees
 
 print("Lecture des données ------------------------")
 
 departements_paris = ["75", "92", "93", "94"]
 
 SOURCES = {
-    "dvf.parquet":
-        "https://minio.lab.sspcloud.fr/projet-formation/nouvelles-sources/data/geoparquet/dvf.parquet",
-    "filosofi_carreaux_200m_2021.parquet":
-        "https://www.data.gouv.fr/api/1/datasets/r/55432374-a91d-43d0-923d-4514dc3eb951",
+    "dvf.parquet": ("https://minio.lab.sspcloud.fr/projet-formation/"
+                    "nouvelles-sources/data/geoparquet/dvf.parquet"),
+    "filosofi_carreaux_200m_2021.parquet": ("https://www.data.gouv.fr/api/1/"
+                                            "datasets/r/55432374-a91d-43d0-"
+                                            "923d-4514dc3eb951"),
 }
 
+
 def download_sources(url, cible):
+    """
+    telecharge les sources
+
+    Inputs :
+    url : string, url de la source
+    cible : string,
+    """
     r = requests.get(url, timeout=120)
     r.raise_for_status()
     with open(cible, "wb") as f:
         f.write(r.content)
 
 
-
-jetonapi = "1SuperJetonUltraConfidentiel!!!"
+JETONAPI = os.environ["JETON_API"]
 
 
 data_location = Path("data")
@@ -37,11 +69,11 @@ data_location.mkdir(exist_ok=True)
 for nom, url in SOURCES.items():
     cible = data_location / nom
     if cible.exists():
-        print(f"{nom:42s} déjà présent ({cible.stat().st_size/1e6:.0f} Mo)")
+        print(f"{nom:42s} déjà présent ({cible.stat().st_size / 1e6:.0f} Mo)")
     else:
         print(f"Téléchargement de {nom} ...")
         download_sources(url, cible)
-        print(f"  -> {cible.stat().st_size/1e6:.0f} Mo")
+        print(f"  -> {cible.stat().st_size / 1e6:.0f} Mo")
 
 
 dvf = gpd.read_parquet(data_location / "dvf.parquet")
@@ -91,7 +123,7 @@ message = message_ok if n_missing == 0 else message_warn
 print(message)
 
 
-dvf = dvf.loc[dvf['valeur_fonciere']<1e6]
+dvf = dvf.loc[dvf["valeur_fonciere"] < 1e6]
 dvf["annee"] = pd.to_datetime(dvf["date_mutation"]).dt.year
 
 
@@ -101,25 +133,44 @@ dvf["annee"] = pd.to_datetime(dvf["date_mutation"]).dt.year
 # Source: données carroyées Filosofi
 
 filo_cols = [
-    "idcar_200m", "ind", "men", "men_pauv", "men_prop",
-    "ind_snv", "log_soc", "log_av45", "men_surf", "geometry"]
-filo = gpd.read_parquet(data_location / "filosofi_carreaux_200m_2021.parquet", columns=filo_cols)
+    "idcar_200m",
+    "ind",
+    "men",
+    "men_pauv",
+    "men_prop",
+    "ind_snv",
+    "log_soc",
+    "log_av45",
+    "men_surf",
+    "geometry",
+]
+filo = gpd.read_parquet(
+    data_location / "filosofi_carreaux_200m_2021.parquet", columns=filo_cols
+)
 filo = filo.rename(
-    columns = {
-        "men": "nbre_menages", "men_pauv": "nbre_menages_pauvres", "men_prop": "nbre_menages_prop", "ind_snv": "somme_nv_vie",
-        "log_soc": "nbre_logements_sociaux", "log_av45": "nbre_logements_avant_1945", "men_surf": "surface_totale_logements"
+    columns={
+        "men": "nbre_menages",
+        "men_pauv": "nbre_menages_pauvres",
+        "men_prop": "nbre_menages_prop",
+        "ind_snv": "somme_nv_vie",
+        "log_soc": "nbre_logements_sociaux",
+        "log_av45": "nbre_logements_avant_1945",
+        "men_surf": "surface_totale_logements",
     }
 )
 
-print(f"Reprojection de {dvf.shape[0]} de transactions immobilières du CRS {dvf.crs.to_epsg()} à {filo.crs.to_epsg()}")
+print(
+    f"Reprojection de {dvf.shape[0]} de transactions immobilières "
+    f"du CRS {dvf.crs.to_epsg()} à {filo.crs.to_epsg()}"
+)
 
 dvf = dvf.to_crs(filo.crs)
 dvf = dvf.sjoin(filo, how="left", predicate="within")
 
 
-print('Restriction aux départements de la petite couronne')
+print("Restriction aux départements de la petite couronne")
 
-dvf = dvf.loc[dvf['code_departement'].isin(departements_paris)]
+dvf = dvf.loc[dvf["code_departement"].isin(departements_paris)]
 
 
 # 2/ Données au niveau communal ====================
@@ -140,24 +191,24 @@ geo_level = ["COM", "ARM"]
 url = f"https://api.insee.fr/melodi/data/{dataset}"
 
 params = {
-  "GEO": geo_level,
-  dimension: code,
-  "TIME_PERIOD": time_period,
-  "maxResult": 40000,
+    "GEO": geo_level,
+    dimension: code,
+    "TIME_PERIOD": time_period,
+    "maxResult": 40000,
 }
 
-headers = {"Authorization": f"Bearer {jetonapi}"}
+headers = {"Authorization": f"Bearer {JETONAPI}"}
 
 response = requests.get(url, params=params, headers=headers, timeout=60)
 response.raise_for_status()
 observations = response.json()["observations"]
 
 niveau_vie = pd.DataFrame(
-  {
-    "CODGEO": obs["dimensions"]["GEO"].split("-")[-1],
-    value_name: obs["measures"]["OBS_VALUE_NIVEAU"].get("value"),
-  }
-  for obs in observations
+    {
+        "CODGEO": obs["dimensions"]["GEO"].split("-")[-1],
+        value_name: obs["measures"]["OBS_VALUE_NIVEAU"].get("value"),
+    }
+    for obs in observations
 )
 
 # Taux de pauvreté (niveau commune)
@@ -172,42 +223,44 @@ geo_level = ["COM", "ARM"]
 url = f"https://api.insee.fr/melodi/data/{dataset}"
 
 params = {
-  "GEO": geo_level,
-  dimension: code,
-  "TIME_PERIOD": time_period,
-  "maxResult": 40000,
+    "GEO": geo_level,
+    dimension: code,
+    "TIME_PERIOD": time_period,
+    "maxResult": 40000,
 }
 
-headers = {"Authorization": f"Bearer {jetonapi}"}
+headers = {"Authorization": f"Bearer {JETONAPI}"}
 
 response = requests.get(url, params=params, headers=headers, timeout=60)
 response.raise_for_status()
 observations = response.json()["observations"]
 
 taux_pauvrete = pd.DataFrame(
-  {
-    "CODGEO": obs["dimensions"]["GEO"].split("-")[-1],
-    value_name: obs["measures"]["OBS_VALUE_NIVEAU"].get("value"),
-  }
-  for obs in observations
+    {
+        "CODGEO": obs["dimensions"]["GEO"].split("-")[-1],
+        value_name: obs["measures"]["OBS_VALUE_NIVEAU"].get("value"),
+    }
+    for obs in observations
 )
 
 
 # Merge aux données initiales
 
-dvf = dvf.merge(niveau_vie, left_on="code_commune", right_on="CODGEO", how="left").drop(columns="CODGEO")
-dvf = dvf.merge(taux_pauvrete, left_on="code_commune", right_on="CODGEO", how="left").drop(columns="CODGEO")
-
-print(
-    dvf.head(5)
+dvf = dvf.merge(niveau_vie, left_on="code_commune", right_on="CODGEO", how="left").drop(
+    columns="CODGEO"
 )
+dvf = dvf.merge(
+    taux_pauvrete, left_on="code_commune", right_on="CODGEO", how="left"
+).drop(columns="CODGEO")
+
+print(dvf.head(5))
 
 # Un peu d'exploration et de feature engineering
 
 print("Statistiques descriptives ---------------------")
 
 sns.histplot(data=dvf, x="valeur_fonciere")
-sns.histplot(data=dvf, x="valeur_fonciere", log_scale = True)
+sns.histplot(data=dvf, x="valeur_fonciere", log_scale=True)
 
 
 grid = sns.scatterplot(data=dvf, x="surface_reelle_bati", y="valeur_fonciere")
@@ -216,23 +269,24 @@ grid.set(xscale="log", yscale="log")
 
 print("Feature engineering")
 
-import numpy as np
 
-dvf['tx_pauvrete'] = dvf['nbre_menages_pauvres']/dvf['nbre_menages']
-dvf['nv_vie_moyen'] = dvf['somme_nv_vie']/dvf['nbre_menages']
+dvf["tx_pauvrete"] = dvf["nbre_menages_pauvres"] / dvf["nbre_menages"]
+dvf["nv_vie_moyen"] = dvf["somme_nv_vie"] / dvf["nbre_menages"]
 # Dans Filosofi, chaque ménage occupe un logement : on peut donc rapporter
 # les comptes de logements au nombre de ménages du carreau.
-dvf['part_proprietaires'] = dvf['nbre_menages_prop']/dvf['nbre_menages']
-dvf['part_logements_sociaux'] = dvf['nbre_logements_sociaux']/dvf['nbre_menages']
-dvf['part_logements_avant_1945'] = dvf['nbre_logements_avant_1945']/dvf['nbre_menages']
-dvf['surface_moyenne_logements'] = dvf['surface_totale_logements']/dvf['nbre_menages']
-dvf['prix_m2'] = dvf['valeur_fonciere']/dvf['surface_reelle_bati']
+dvf["part_proprietaires"] = dvf["nbre_menages_prop"] / dvf["nbre_menages"]
+dvf["part_logements_sociaux"] = dvf["nbre_logements_sociaux"] / dvf["nbre_menages"]
+dvf["part_logements_avant_1945"] = (
+    dvf["nbre_logements_avant_1945"] / dvf["nbre_menages"]
+)
+dvf["surface_moyenne_logements"] = dvf["surface_totale_logements"] / dvf["nbre_menages"]
+dvf["prix_m2"] = dvf["valeur_fonciere"] / dvf["surface_reelle_bati"]
 
 # On écarte le centile inférieur et supérieur de prix au m² : ventes multi-lots,
 # démembrements ou erreurs de saisie DVF. Sans ce filtre le modèle apprend en
 # bonne partie du bruit (R² test ~0.39 contre ~0.61 une fois ces valeurs écartées).
-borne_basse, borne_haute = dvf['prix_m2'].quantile([0.01, 0.99])
-dvf = dvf.loc[dvf['prix_m2'].between(borne_basse, borne_haute)]
+borne_basse, borne_haute = dvf["prix_m2"].quantile([0.01, 0.99])
+dvf = dvf.loc[dvf["prix_m2"].between(borne_basse, borne_haute)]
 
 # Les bornes ci-dessus sont tirées par Paris (≈ 21 000 €/m² en haut) : en
 # banlieue, des ventes à 15-20 000 €/m² (erreurs de surface, ventes groupées)
@@ -240,36 +294,50 @@ dvf = dvf.loc[dvf['prix_m2'].between(borne_basse, borne_haute)]
 # On applique donc le même filtre au marché local, commune par commune.
 prix_m2_par_commune = dvf.groupby("code_commune")["prix_m2"]
 dvf = dvf.loc[
-    dvf['prix_m2'].between(
+    dvf["prix_m2"].between(
         prix_m2_par_commune.transform("quantile", 0.01),
         prix_m2_par_commune.transform("quantile", 0.99),
     )
 ]
 
-dvf['log_surface'] = np.log(dvf["surface_reelle_bati"])
+dvf["log_surface"] = np.log(dvf["surface_reelle_bati"])
 
 # Ce qui est vendu en plus du logement lui-même : le prix DVF inclut les
 # dépendances (cave, parking = lots supplémentaires) et le terrain des maisons.
 # Le rapport surface Carrez / surface bâtie signale les ventes où la surface
 # déclarée ne correspond pas au bien (pas de Carrez hors copropriété -> NaN).
-dvf['log_surface_terrain'] = np.log1p(dvf['surface_terrain'].fillna(0))
-dvf['ratio_carrez'] = dvf['lot1_surface_carrez']/dvf['surface_reelle_bati']
+dvf["log_surface_terrain"] = np.log1p(dvf["surface_terrain"].fillna(0))
+dvf["ratio_carrez"] = dvf["lot1_surface_carrez"] / dvf["surface_reelle_bati"]
 
 # Distance à la tour Eiffel (proxy de centralité, très corrélé au prix en IdF).
 # On calcule la distance en Lambert-93 (mètres) puis on passe en log(1 + km).
-tour_eiffel = gpd.GeoSeries.from_xy([2.2945], [48.8584], crs="EPSG:4326").to_crs("EPSG:2154")
-distance_eiffel_km = dvf.geometry.to_crs("EPSG:2154").distance(tour_eiffel.iloc[0]) / 1000
-dvf['log_distance_eiffel'] = np.log1p(distance_eiffel_km)
+tour_eiffel = gpd.GeoSeries.from_xy([2.2945], [48.8584], crs="EPSG:4326").to_crs(
+    "EPSG:2154"
+)
+distance_eiffel_km = (
+    dvf.geometry.to_crs("EPSG:2154").distance(tour_eiffel.iloc[0]) / 1000
+)
+dvf["log_distance_eiffel"] = np.log1p(distance_eiffel_km)
 
 
 # CREATION DU PIPELINE --------------------------------------
 
 numeric_features = [
-    "log_surface", "log_distance_eiffel", "nombre_pieces_principales",
-    "nombre_lots", "log_surface_terrain", "ratio_carrez",
-    "nbre_menages", "tx_pauvrete", "nv_vie_moyen",
-    "part_proprietaires", "part_logements_sociaux", "part_logements_avant_1945", "surface_moyenne_logements",
-    "NIVVIE_MEDIAN", "TAUX_PAUVRETE"
+    "log_surface",
+    "log_distance_eiffel",
+    "nombre_pieces_principales",
+    "nombre_lots",
+    "log_surface_terrain",
+    "ratio_carrez",
+    "nbre_menages",
+    "tx_pauvrete",
+    "nv_vie_moyen",
+    "part_proprietaires",
+    "part_logements_sociaux",
+    "part_logements_avant_1945",
+    "surface_moyenne_logements",
+    "NIVVIE_MEDIAN",
+    "TAUX_PAUVRETE",
 ]
 categorical_features = ["code_commune", "type_local"]
 features = list(set(numeric_features + categorical_features))
@@ -282,7 +350,9 @@ dvf_start_data = dvf.dropna(subset=["prix_m2"])
 
 ## Prix au m2 par commune
 
-prix_m2_commune = dvf.groupby(["code_commune", "nom_commune"])["prix_m2"].mean().sort_values()
+prix_m2_commune = (
+    dvf.groupby(["code_commune", "nom_commune"])["prix_m2"].mean().sort_values()
+)
 
 print("Bottom 5 communes (prix au m2 le plus bas) :")
 print(prix_m2_commune.head(5))
@@ -291,13 +361,6 @@ print(prix_m2_commune.tail(5))
 
 
 ## Encoder les données imputées ou transformées.
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import OrdinalEncoder, FunctionTransformer
-from sklearn.impute import SimpleImputer
-from sklearn.pipeline import Pipeline
-from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
-from lightgbm import LGBMRegressor
-
 
 def as_category(df):
     """Convertit les colonnes en dtype 'category' pour que LightGBM les
@@ -305,15 +368,22 @@ def as_category(df):
     return df.astype("category")
 
 
-numeric_transformer = Pipeline(steps=[
-    ("imputer", SimpleImputer(strategy="median")),
-])
+numeric_transformer = Pipeline(
+    steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+    ]
+)
 
-categorical_transformer = Pipeline(steps=[
-    ("imputer", SimpleImputer(strategy="most_frequent")),
-    ("ordinal", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)),
-    ("as_category", FunctionTransformer(as_category)),
-])
+categorical_transformer = Pipeline(
+    steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        (
+            "ordinal",
+            OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1),
+        ),
+        ("as_category", FunctionTransformer(as_category)),
+    ]
+)
 
 preprocessor = ColumnTransformer(
     transformers=[
@@ -322,47 +392,56 @@ preprocessor = ColumnTransformer(
     ]
 ).set_output(transform="pandas")
 
-_pipe = Pipeline([
-    ("preprocessor", preprocessor),
-    ("regressor", LGBMRegressor(
-        n_estimators=1500,
-        learning_rate=0.03,
-        num_leaves=31,
-        min_child_samples=10,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=0,
-        verbose=-1,
-    )),
-])
+_pipe = Pipeline(
+    [
+        ("preprocessor", preprocessor),
+        (
+            "regressor",
+            LGBMRegressor(
+                n_estimators=n_trees,
+                learning_rate=0.03,
+                num_leaves=31,
+                min_child_samples=10,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                random_state=0,
+                verbose=-1,
+            ),
+        ),
+    ]
+)
 
 # Le prix au m² est très asymétrique : on apprend sur log(1 + prix) et on
 # repasse en euros à la prédiction. La perte quadratique est alors moins
 # dominée par les transactions les plus chères.
-pipe = TransformedTargetRegressor(
-    regressor=_pipe, func=np.log1p, inverse_func=np.expm1
-)
+pipe = TransformedTargetRegressor(regressor=_pipe, func=np.log1p, inverse_func=np.expm1)
 
 
 # splitting samples
 X = dvf_start_data[features]
 y = dvf_start_data["prix_m2"]
-#weights = dvf_start_data["code_commune"] + "_" + dvf_start_data["annee"].astype(str)
+# weights = dvf_start_data["code_commune"] + "_" + dvf_start_data["annee"].astype(str)
 
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.1, random_state=0)# stratify = weights)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.1, random_state=0
+)  # stratify = weights)
 
 pd.concat([X_train, y_train], axis=1).to_csv("train.csv")
 pd.concat([X_test, y_test], axis=1).to_csv("test.csv")
 
 # check que toutes les modalités du test sont connues du modèle
-if set(X_test["code_commune"].dropna().unique()) - set(X_train["code_commune"].dropna().unique()):
+if set(X_test["code_commune"].dropna().unique()) - set(
+    X_train["code_commune"].dropna().unique()
+):
     message = "Modalités de code_commune absentes de l'apprentissage"
 else:
     message = "Toutes les modalités de code_commune du test sont connues du modèle"
 
 print(message)
 
-if set(X_test["type_local"].dropna().unique()) - set(X_train["type_local"].dropna().unique()):
+if set(X_test["type_local"].dropna().unique()) - set(
+    X_train["type_local"].dropna().unique()
+):
     message = "Modalités de type_local absentes de l'apprentissage"
 else:
     message = "Toutes les modalités de code_commune du test sont connues du modèle"
@@ -376,7 +455,6 @@ pipe.fit(X_train, y_train)
 
 
 # RMSE du modèle
-from sklearn.metrics import root_mean_squared_error
 
 rmse_train = root_mean_squared_error(y_train, pipe.predict(X_train))
 rmse_test = root_mean_squared_error(y_test, pipe.predict(X_test))
@@ -390,7 +468,9 @@ residuals["pred"] = pipe.predict(X_test)
 
 rmse_commune = (
     residuals.groupby("code_commune")
-    .apply(lambda d: root_mean_squared_error(d["y_test"], d["pred"]), include_groups=False)
+    .apply(
+        lambda d: root_mean_squared_error(d["y_test"], d["pred"]), include_groups=False
+    )
     .rename("rmse")
     .reset_index()
 )
@@ -406,9 +486,6 @@ print(rmse_commune.tail(5))
 
 
 # Évaluation de la qualité du modèle avec skore ---------------------
-import matplotlib.pyplot as plt
-from sklearn.base import clone
-from skore import EstimatorReport, CrossValidationReport
 
 print("Évaluation skore ---------------------")
 
