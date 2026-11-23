@@ -15,19 +15,19 @@ from dotenv import load_dotenv
 from sklearn.metrics import root_mean_squared_error
 from sklearn.model_selection import train_test_split
 
-from check import (
+from src.data.check import (
     check_code_commune_formatting,
     check_missing_values,
     check_unseen_categories,
 )
-from evaluation import evaluate_with_skore, rmse_by_commune
-from features import build_features
-from import_data import (
+from src.models.evaluation import evaluate_with_skore, rmse_by_commune
+from src.data.features import build_features
+from src.data.import_data import (
     add_filosofi_carreaux,
     add_filosofi_communes,
     download_missing_sources,
 )
-from model import create_pipeline
+from src.models.model import create_pipeline
 
 load_dotenv()
 con = duckdb.connect(database=":memory:")
